@@ -1,0 +1,1027 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  InfraSight - CloudKeeper-style cost optimization and housekeeping checks.
+  Toggleable demo: Create sample resources (EC2, RDS, S3) and a scheduled Lambda
+  that runs multiple checks and emails/stores a report. Extended insights: EC2 over-provisioned,
+  Spot candidates, ASG under-utilization, EBS gp2->gp3, orphaned snapshots, RDS under-utilized,
+  S3 lifecycle missing, unused target groups, IAM unused keys/roles, RI & SP recommendations.
+
+Parameters:
+  CreateSampleResources:
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes","No"]
+    Description: "If Yes, create demo EC2, RDS and S3 resources for scanning. If No, only deploy the checker."
+
+  SenderEmail:
+    Type: String
+    Description: "Verified SES sender email address (must be verified before sending)."
+
+  EmailRecipients:
+    Type: String
+    Description: "Comma-separated list of recipient emails (SES recipients must be verified if SES sandbox)."
+
+  S3BucketName:
+    Type: String
+    Default: ""
+    Description: "Optional S3 bucket to store reports. If blank the stack will create one."
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: "SSM param for latest Amazon Linux 2023 AMI"
+
+Conditions:
+  CreateSamples: !Equals [ !Ref CreateSampleResources, "Yes" ]
+  UseProvidedBucket: !Not [ !Equals [ !Ref S3BucketName, "" ] ]
+  CreateReportsBucket: !Equals [ !Ref S3BucketName, "" ]
+
+Resources:
+
+  ### Demo infra (toggleable) ###
+  DemoVPC:
+    Type: AWS::EC2::VPC
+    Condition: CreateSamples
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-vpc
+
+  DemoSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateSamples
+    Properties:
+      VpcId: !Ref DemoVPC
+      CidrBlock: 10.10.0.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-subnet-a
+
+  DemoSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateSamples
+    Properties:
+      VpcId: !Ref DemoVPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-subnet-b
+
+  DemoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateSamples
+    Properties:
+      GroupDescription: infrasight demo sg
+      VpcId: !Ref DemoVPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-sg
+
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    Condition: CreateSamples
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref DemoSubnetA
+      SecurityGroupIds:
+        - !Ref DemoSecurityGroup
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-ec2
+        - Key: Env
+          Value: dev
+
+  DemoDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: CreateSamples
+    Properties:
+      DBSubnetGroupDescription: infrasight demo db subnet
+      SubnetIds:
+        - !Ref DemoSubnetA
+        - !Ref DemoSubnetB
+      DBSubnetGroupName: infrasight-demo-dbsubnet
+
+  DemoRDS:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateSamples
+    Properties:
+      DBInstanceIdentifier: infrasight-demo-db
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      MasterUsername: adminuser
+      MasterUserPassword: !Join ['', ['P@ss', !Ref "AWS::StackName"]]
+      AllocatedStorage: 20
+      DBSubnetGroupName: !Ref DemoDBSubnetGroup
+      PubliclyAccessible: false
+      DeletionProtection: false
+      BackupRetentionPeriod: 0
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-rds
+        - Key: Env
+          Value: dev
+
+  DemoS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateSamples
+    Properties:
+      BucketName: !Sub infrasight-demo-bucket-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: infrasight-demo-bucket
+
+  ### Reports bucket (if not provided) ###
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateReportsBucket
+    Properties:
+      BucketName: !Sub infrasight-reports-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: infrasight-reports
+
+  ### IAM Role for Lambda ###
+  InfraSightLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub InfraSightLambdaRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      Path: "/"
+      Policies:
+        - PolicyName: InfraSightMainPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+              # Cost Explorer & Rightsizing & Savings Plans & RI recs
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetRightsizingRecommendations
+                  - ce:GetSavingsPlansPurchaseRecommendation
+                  - ce:GetReservationPurchaseRecommendation
+                Resource: "*"
+
+              # Compute Optimizer
+              - Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                Resource: "*"
+
+              # EC2 / EBS / ELB / Autoscaling read
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumeAttribute
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeImages
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstanceStatus
+                  - elb:DescribeLoadBalancers
+                  - elb:DescribeInstanceHealth
+                  - elbv2:DescribeLoadBalancers
+                  - elbv2:DescribeTargetGroups
+                  - elbv2:DescribeTargetHealth
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
+
+              # RDS read
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBSnapshots
+                Resource: "*"
+
+              # IAM read for credential/last-used insights
+              - Effect: Allow
+                Action:
+                  - iam:GenerateCredentialReport
+                  - iam:GetCredentialReport
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                  - iam:ListRoles
+                  - iam:GetRole
+                Resource: "*"
+
+              # CloudWatch metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+
+              # S3 write for reports and read for bucket listing / lifecycle
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLifecycleConfiguration
+                  - s3:GetBucketLocation
+                Resource: "*"
+
+              # SES send
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+
+  ### Lambda function that runs checks and emails report ###
+  InfraSightFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub infrasight-checker-${AWS::StackName}
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt InfraSightLambdaRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !If [ UseProvidedBucket, !Ref S3BucketName, !Ref ReportsBucket ]
+          SENDER_EMAIL: !Ref SenderEmail
+          RECIPIENTS: !Ref EmailRecipients
+          DEFAULT_REGION: !Ref "AWS::Region"
+          ACCOUNT_ID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          #!/usr/bin/env python3
+          import os, io, csv, json, logging, base64
+          from datetime import datetime, timedelta
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          S3_BUCKET = os.environ.get("S3_BUCKET")
+          SENDER = os.environ.get("SENDER_EMAIL")
+          RECIPIENTS = [e.strip() for e in os.environ.get("RECIPIENTS","").split(",") if e.strip()]
+          REGION = os.environ.get("DEFAULT_REGION", "us-east-1")
+          ACCOUNT_ID = os.environ.get("ACCOUNT_ID","account")
+
+          # Tunables
+          EC2_IDLE_CPU_THRESHOLD = 5.0
+          EC2_OVER_PROVISIONED_CPU_MAX = 20.0
+          RDS_IDLE_CPU_THRESHOLD = 5.0
+          RDS_LOW_CONN_THRESHOLD = 2
+          IDLE_DAYS = 7
+          OLD_SNAPSHOT_DAYS = 30
+          S3_UNUSED_DAYS = 90
+          LB_LOW_REQUESTS_THRESHOLD = 10
+          SPOT_CPU_THRESHOLD = 20.0
+          IAM_KEY_UNUSED_DAYS = 90
+          ROLE_UNUSED_DAYS = 90
+
+          def get_clients(creds=None):
+              kw = dict(region_name=REGION, **creds) if creds else dict(region_name=REGION)
+              return {
+                  "ce": boto3.client("ce", **kw),
+                  "co": boto3.client("compute-optimizer", **kw),
+                  "ec2": boto3.client("ec2", **kw),
+                  "rds": boto3.client("rds", **kw),
+                  "cw": boto3.client("cloudwatch", **kw),
+                  "s3": boto3.client("s3", **kw),
+                  "ses": boto3.client("ses", **kw),
+                  "elbv2": boto3.client("elbv2", **kw),
+                  "elb": boto3.client("elb", **kw),
+                  "asg": boto3.client("autoscaling", **kw),
+                  "iam": boto3.client("iam", **kw),
+              }
+
+          # ---------- Cost & savings ----------
+
+          def get_monthly_cost(clients):
+              ce = clients["ce"]
+              now = datetime.utcnow()
+              # last two full months (if end == current month start)
+              start = (now.replace(day=1) - timedelta(days=60)).replace(day=1)
+              end = now.replace(day=1)
+              try:
+                  paginator = ce.get_paginator("get_cost_and_usage")
+                  results = []
+                  for page in paginator.paginate(
+                      TimePeriod={"Start": start.strftime("%Y-%m-%d"), "End": end.strftime("%Y-%m-%d")},
+                      Granularity="MONTHLY",
+                      Metrics=["UnblendedCost"],
+                      GroupBy=[{"Type":"DIMENSION","Key":"SERVICE"}],
+                  ):
+                      for r in page.get("ResultsByTime", []):
+                          month = r.get("TimePeriod",{}).get("Start")
+                          for g in r.get("Groups", []):
+                              results.append({"month": month, "service": g["Keys"][0], "amount": float(g["Metrics"]["UnblendedCost"]["Amount"])})
+                  return results
+              except Exception as e:
+                  logger.warning("Cost Explorer error: %s", e)
+                  return []
+
+          def get_compute_optimizer_recs(clients):
+              co = clients["co"]
+              recs, token = [], None
+              try:
+                  while True:
+                      args = {"NextToken": token} if token else {}
+                      resp = co.get_ec2_instance_recommendations(**args)
+                      recs.extend(resp.get("instanceRecommendations", []))
+                      token = resp.get("NextToken")
+                      if not token:
+                          break
+              except Exception as e:
+                  logger.warning("Compute Optimizer error: %s", e)
+              return recs
+
+          def get_rightsizing(clients):
+              ce = clients["ce"]
+              recs, token = [], None
+              try:
+                  while True:
+                      args = {"Service": "AmazonEC2"}
+                      if token:
+                          args["NextPageToken"] = token
+                      resp = ce.get_rightsizing_recommendations(**args)
+                      recs.extend(resp.get("RightsizingRecommendations", []))
+                      token = resp.get("NextPageToken")
+                      if not token:
+                          break
+              except ClientError as e:
+                  logger.warning("Rightsizing recommendation error: %s", e)
+              except Exception as e:
+                  logger.warning("Rightsizing general error: %s", e)
+              return recs
+
+          def get_savings_plan(clients):
+              ce = clients["ce"]
+              try:
+                  return ce.get_savings_plans_purchase_recommendation(
+                      SavingsPlansType="COMPUTE_SP",
+                      TermInYears="ONE_YEAR",
+                      PaymentOption="NO_UPFRONT",
+                      LookbackPeriodInDays="SEVEN_DAYS",
+                      AccountScope="PAYER"
+                  ).get("SavingsPlansPurchaseRecommendation", {})
+              except Exception as e:
+                  logger.warning("Savings Plans rec failed: %s", e)
+                  return {}
+
+          def get_ri_recs(clients):
+              ce = clients["ce"]
+              try:
+                  return ce.get_reservation_purchase_recommendation(
+                      Service="AmazonEC2",
+                      LookbackPeriodInDays="SEVEN_DAYS",
+                      TermInYears="ONE_YEAR",
+                      PaymentOption="NO_UPFRONT"
+                  ).get("Recommendations", [])
+              except Exception as e:
+                  logger.warning("RI recs failed: %s", e)
+                  return []
+
+          # ---------- EC2 / RDS utilization ----------
+
+          def cw_avg(cw, ns, metric, dims, start, end, stat="Average", period=86400):
+              try:
+                  resp = cw.get_metric_statistics(
+                      Namespace=ns, MetricName=metric, Dimensions=dims,
+                      StartTime=start, EndTime=end, Period=period, Statistics=[stat]
+                  )
+                  pts = resp.get("Datapoints", [])
+                  if not pts: return None
+                  if stat == "Sum":
+                      return sum(p["Sum"] for p in pts) / len(pts)
+                  return sum(p["Average"] for p in pts) / len(pts)
+              except Exception as e:
+                  logger.debug("CW metric %s/%s failed: %s", ns, metric, e)
+                  return None
+
+          def list_running_instances(ec2):
+              res = ec2.describe_instances(Filters=[{"Name":"instance-state-name","Values":["running"]}])
+              instances = []
+              for rr in res.get("Reservations", []):
+                  for i in rr.get("Instances", []):
+                      instances.append(i)
+              return instances
+
+          def detect_idle_ec2(clients, cpu_threshold=EC2_IDLE_CPU_THRESHOLD, days=IDLE_DAYS):
+              ec2, cw = clients["ec2"], clients["cw"]
+              idle = []
+              try:
+                  instances = list_running_instances(ec2)
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for inst in instances:
+                      iid = inst["InstanceId"]
+                      avg = cw_avg(cw, "AWS/EC2", "CPUUtilization",
+                                   [{"Name":"InstanceId","Value":iid}], start, end)
+                      if avg is not None and avg < cpu_threshold:
+                          idle.append({"instanceId": iid, "avgCpu": round(avg,2)})
+              except Exception as e:
+                  logger.warning("EC2 idle detect failed: %s", e)
+              return idle
+
+          def detect_over_provisioned_ec2(clients, cpu_max=EC2_OVER_PROVISIONED_CPU_MAX, days=IDLE_DAYS):
+              ec2, cw = clients["ec2"], clients["cw"]
+              over = []
+              try:
+                  instances = list_running_instances(ec2)
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for inst in instances:
+                      iid = inst["InstanceId"]
+                      itype = inst.get("InstanceType")
+                      cpu = cw_avg(cw, "AWS/EC2", "CPUUtilization",
+                                   [{"Name":"InstanceId","Value":iid}], start, end)
+                      netin = cw_avg(cw, "AWS/EC2", "NetworkIn",
+                                     [{"Name":"InstanceId","Value":iid}], start, end, stat="Sum")
+                      netout = cw_avg(cw, "AWS/EC2", "NetworkOut",
+                                      [{"Name":"InstanceId","Value":iid}], start, end, stat="Sum")
+                      if cpu is None: 
+                          continue
+                      if cpu < cpu_max:
+                          over.append({"instanceId": iid, "type": itype, "avgCpu": round(cpu,2),
+                                       "avgNetInBytes": int(netin or 0), "avgNetOutBytes": int(netout or 0)})
+              except Exception as e:
+                  logger.warning("Over-provision detect failed: %s", e)
+              return over
+
+          def detect_spot_candidates(clients, cpu_threshold=SPOT_CPU_THRESHOLD, days=IDLE_DAYS):
+              ec2, cw = clients["ec2"], clients["cw"]
+              cands = []
+              try:
+                  instances = list_running_instances(ec2)
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for inst in instances:
+                      iid = inst["InstanceId"]
+                      itype = inst.get("InstanceType")
+                      tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                      env = (tags.get("Env") or tags.get("Environment") or "").lower()
+                      name = tags.get("Name","").lower()
+                      nonprod = env in ["dev","test","qa","nonprod","staging"] or any(x in name for x in ["dev","qa","test","stage"])
+                      if not nonprod:
+                          continue
+                      cpu = cw_avg(cw, "AWS/EC2", "CPUUtilization",
+                                   [{"Name":"InstanceId","Value":iid}], start, end)
+                      if cpu is not None and cpu < cpu_threshold:
+                          cands.append({"instanceId": iid, "type": itype, "avgCpu": round(cpu,2), "suggested": "Consider Spot"})
+              except Exception as e:
+                  logger.warning("Spot candidate detect failed: %s", e)
+              return cands
+
+          # ---------- EBS ----------
+
+          def detect_unattached_volumes(clients):
+              ec2 = clients["ec2"]; unattached = []
+              try:
+                  paginator = ec2.get_paginator("describe_volumes")
+                  for page in paginator.paginate(Filters=[{"Name":"status","Values":["available"]}]):
+                      for v in page.get("Volumes", []):
+                          unattached.append(v["VolumeId"])
+              except Exception as e:
+                  logger.warning("Describe volumes failed: %s", e)
+              return unattached
+
+          def suggest_gp2_to_gp3(clients):
+              """Simple heuristic: gp2 volumes are almost always cheaper as gp3; suggest conversion."""
+              ec2 = clients["ec2"]; recs = []
+              try:
+                  paginator = ec2.get_paginator("describe_volumes")
+                  for page in paginator.paginate(Filters=[{"Name":"volume-type","Values":["gp2"]}]):
+                      for v in page.get("Volumes", []):
+                          recs.append({"volumeId": v["VolumeId"], "sizeGiB": v["Size"], "type": "gp2", "suggested": "Migrate to gp3"})
+              except Exception as e:
+                  logger.warning("gp2->gp3 scan failed: %s", e)
+              return recs
+
+          def detect_old_snapshots(clients, older_than_days=OLD_SNAPSHOT_DAYS):
+              ec2 = clients["ec2"]; old = []
+              try:
+                  snaps = ec2.describe_snapshots(OwnerIds=["self"]).get("Snapshots", [])
+                  cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+                  for s in snaps:
+                      st = s.get("StartTime")
+                      if st and st.replace(tzinfo=None) < cutoff:
+                          old.append(s["SnapshotId"])
+              except Exception as e:
+                  logger.warning("Describe snapshots failed: %s", e)
+              return old
+
+          def detect_orphaned_snapshots(clients):
+              """Snapshots not referenced by any AMI."""
+              ec2 = clients["ec2"]; orphaned = []
+              try:
+                  images = ec2.describe_images(Owners=["self"]).get("Images", [])
+                  ami_snap_ids = set()
+                  for img in images:
+                      for bd in img.get("BlockDeviceMappings", []):
+                          ebs = bd.get("Ebs")
+                          if ebs and "SnapshotId" in ebs:
+                              ami_snap_ids.add(ebs["SnapshotId"])
+                  snaps = ec2.describe_snapshots(OwnerIds=["self"]).get("Snapshots", [])
+                  for s in snaps:
+                      sid = s["SnapshotId"]
+                      if sid not in ami_snap_ids:
+                          orphaned.append(sid)
+              except Exception as e:
+                  logger.warning("Orphaned snapshot detect failed: %s", e)
+              return orphaned
+
+          # ---------- ELB / ASG ----------
+
+          def detect_low_traffic_elbs(clients, threshold=LB_LOW_REQUESTS_THRESHOLD, days=IDLE_DAYS):
+              elbv2, cw = clients["elbv2"], clients["cw"]
+              low = []
+              try:
+                  lbs = elbv2.describe_load_balancers().get("LoadBalancers", [])
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for lb in lbs:
+                      arn = lb.get("LoadBalancerArn"); name = lb.get("LoadBalancerName")
+                      try:
+                          dim_value = arn.split("loadbalancer/")[1]
+                      except Exception:
+                          dim_value = name
+                      avg_per_day = cw_avg(cw, "AWS/ApplicationELB", "RequestCount",
+                                           [{"Name":"LoadBalancer","Value": dim_value}], start, end, stat="Sum")
+                      if avg_per_day is None or avg_per_day < threshold:
+                          low.append({"name": name, "avgRequestsPerDay": round(avg_per_day or 0,2)})
+              except Exception as e:
+                  logger.warning("ELB describe failed: %s", e)
+              return low
+
+          def detect_unused_target_groups(clients):
+              elbv2 = clients["elbv2"]; unused = []
+              try:
+                  tgs = elbv2.describe_target_groups().get("TargetGroups", [])
+                  for tg in tgs:
+                      arn = tg["TargetGroupArn"]
+                      th = elbv2.describe_target_health(TargetGroupArn=arn)
+                      targets = th.get("TargetHealthDescriptions", [])
+                      healthy = [t for t in targets if t.get("TargetHealth",{}).get("State")=="healthy"]
+                      if len(healthy) == 0:
+                          unused.append({"targetGroupArn": arn, "name": tg.get("TargetGroupName")})
+              except Exception as e:
+                  logger.warning("Unused target group detect failed: %s", e)
+              return unused
+
+          def detect_underutilized_asg(clients, days=IDLE_DAYS):
+              asg, cw = clients["asg"], clients["cw"]
+              under = []
+              try:
+                  groups = asg.describe_auto_scaling_groups().get("AutoScalingGroups", [])
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for g in groups:
+                      name = g["AutoScalingGroupName"]
+                      desired = g.get("DesiredCapacity",0)
+                      # Approximate: use GroupInServiceInstances metric if present
+                      inservice = cw_avg(cw, "AWS/AutoScaling", "GroupInServiceInstances",
+                                         [{"Name":"AutoScalingGroupName","Value":name}], start, end, stat="Average")
+                      if inservice is None:
+                          continue
+                      if desired > 0 and inservice < max(1, desired * 0.5):
+                          under.append({"asg": name, "desired": desired, "avgInService": round(inservice,2)})
+              except Exception as e:
+                  logger.warning("ASG under-util detect failed: %s", e)
+              return under
+
+          # ---------- RDS ----------
+
+          def detect_idle_rds(clients, cpu_threshold=RDS_IDLE_CPU_THRESHOLD, days=IDLE_DAYS):
+              rds, cw = clients["rds"], clients["cw"]
+              idle = []
+              try:
+                  dbs = rds.describe_db_instances().get("DBInstances", [])
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for db in dbs:
+                      dbid = db["DBInstanceIdentifier"]
+                      avg = cw_avg(cw, "AWS/RDS", "CPUUtilization",
+                                   [{"Name":"DBInstanceIdentifier","Value":dbid}], start, end)
+                      if avg is not None and avg < cpu_threshold:
+                          idle.append({"db": dbid, "avgCpu": round(avg,2)})
+              except Exception as e:
+                  logger.warning("RDS describe failed: %s", e)
+              return idle
+
+          def detect_underutilized_rds(clients, days=IDLE_DAYS, low_conn=RDS_LOW_CONN_THRESHOLD):
+              rds, cw = clients["rds"], clients["cw"]
+              under = []
+              try:
+                  dbs = rds.describe_db_instances().get("DBInstances", [])
+                  end = datetime.utcnow(); start = end - timedelta(days=days)
+                  for db in dbs:
+                      dbid = db["DBInstanceIdentifier"]
+                      cpu = cw_avg(cw, "AWS/RDS", "CPUUtilization",
+                                   [{"Name":"DBInstanceIdentifier","Value":dbid}], start, end)
+                      conns = cw_avg(cw, "AWS/RDS", "DatabaseConnections",
+                                     [{"Name":"DBInstanceIdentifier","Value":dbid}], start, end, stat="Average")
+                      free_mem = cw_avg(cw, "AWS/RDS", "FreeableMemory",
+                                        [{"Name":"DBInstanceIdentifier","Value":dbid}], start, end, stat="Average")
+                      if cpu is None: 
+                          continue
+                      if cpu < 20 and (conns is None or conns < low_conn):
+                          under.append({"db": dbid, "avgCpu": round(cpu,2), "avgConnections": round(conns or 0,2), "avgFreeableMB": int((free_mem or 0)/1024/1024)})
+              except Exception as e:
+                  logger.warning("RDS under-util detect failed: %s", e)
+              return under
+
+          # ---------- S3 ----------
+
+          def detect_unused_s3(clients, older_than_days=S3_UNUSED_DAYS):
+              s3 = clients["s3"]; unused = []
+              try:
+                  buckets = s3.list_buckets().get("Buckets", [])
+                  cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+                  for b in buckets:
+                      name = b["Name"]
+                      try:
+                          objs = s3.list_objects_v2(Bucket=name, MaxKeys=1)
+                          if "Contents" not in objs:
+                              unused.append(name)
+                          else:
+                              last = objs["Contents"][0]["LastModified"]
+                              if last.replace(tzinfo=None) < cutoff:
+                                  unused.append(name)
+                      except Exception:
+                          continue
+              except Exception as e:
+                  logger.warning("S3 list buckets failed: %s", e)
+              return unused
+
+          def detect_missing_lifecycle(clients):
+              s3 = clients["s3"]; missing = []
+              try:
+                  buckets = s3.list_buckets().get("Buckets", [])
+                  for b in buckets:
+                      name = b["Name"]
+                      try:
+                          s3.get_bucket_lifecycle_configuration(Bucket=name)
+                      except ClientError as e:
+                          code = e.response.get("Error",{}).get("Code","")
+                          if code in ["NoSuchLifecycleConfiguration","NoSuchLifecycleConfigurationFault","NoSuchLifecycleConfigurationException"]:
+                              missing.append(name)
+                          else:
+                              continue
+              except Exception as e:
+                  logger.warning("S3 lifecycle scan failed: %s", e)
+              return missing
+
+          # ---------- IAM ----------
+
+          def iam_credential_report(client):
+              # Ensure a fresh report exists
+              try:
+                  client.generate_credential_report()
+              except Exception:
+                  pass
+              for _ in range(6):
+                  try:
+                      resp = client.get_credential_report()
+                      if "Content" in resp:
+                          csv_bytes = resp["Content"]
+                          return csv_bytes.decode("utf-8")
+                  except ClientError:
+                      pass
+              return ""
+
+          def detect_unused_access_keys(clients, older_than_days=IAM_KEY_UNUSED_DAYS):
+              iam = clients["iam"]
+              report_csv = iam_credential_report(iam)
+              if not report_csv:
+                  return []
+              import csv as _csv, io as _io
+              cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+              reader = _csv.DictReader(_io.StringIO(report_csv))
+              stale = []
+              for row in reader:
+                  if row.get("user") in ["<root_account>","<root_account> "]:
+                      continue
+                  # Two keys possible
+                  for key_idx in ["1","2"]:
+                      ak = row.get(f"access_key_{key_idx}_active","false").lower() == "true"
+                      last_used = row.get(f"access_key_{key_idx}_last_used_date") or row.get(f"access_key_{key_idx}_last_rotated")
+                      if ak and last_used and last_used != "N/A":
+                          try:
+                              used_dt = datetime.strptime(last_used.split("+")[0].replace("Z",""), "%Y-%m-%dT%H:%M:%S")
+                              if used_dt < cutoff:
+                                  stale.append({"user": row.get("user"), "key_index": key_idx, "lastUsed": last_used})
+                          except Exception:
+                              continue
+              return stale
+
+          def detect_roles_not_recently_used(clients, older_than_days=ROLE_UNUSED_DAYS):
+              iam = clients["iam"]; stale = []
+              try:
+                  paginator = iam.get_paginator("list_roles")
+                  cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+                  for page in paginator.paginate():
+                      for role in page.get("Roles", []):
+                          name = role["RoleName"]
+                          try:
+                              gr = iam.get_role(RoleName=name)
+                              last = gr.get("Role",{}).get("RoleLastUsed",{}).get("LastUsedDate")
+                              if last and last.replace(tzinfo=None) < cutoff:
+                                  stale.append({"role": name, "lastUsed": last.isoformat()})
+                          except Exception:
+                              continue
+              except Exception as e:
+                  logger.warning("IAM roles scan failed: %s", e)
+              return stale
+
+          # ---------- Report generation ----------
+
+          def generate_and_upload_report(clients, report):
+              s3 = clients["s3"]
+              ts = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+              base = f"infrasight/reports/InfraSight_Report_{ts}"
+              csv_key = base + ".csv"
+              html_key = base + ".html"
+
+              buf = io.StringIO()
+              w = csv.writer(buf)
+              # CSV header
+              w.writerow(["section","resource","detail","value"])
+
+              # Cost summary
+              for s in report.get("cost_summary", []):
+                  w.writerow(["cost", f"{s.get('month')}|{s.get('service')}", "unblended_usd", f"{s.get('amount'):.2f}"])
+
+              # Savings
+              for sp in report.get("savings", {}).get("Recommendations", []):
+                  w.writerow(["savings_plan","hourly_commitment_recommended", "", sp.get("MinimumHourlyCommitmentAmount","")])
+              for ri in report.get("ri_recs", []):
+                  w.writerow(["ri_rec", ri.get("AccountScope",""), "term", json.dumps(ri)[:500]])
+
+              # Compute Optimizer graviton-ish
+              for g in report.get("graviton_candidates", []):
+                  w.writerow(["graviton", g.get("instanceId"), g.get("currentType"), g.get("suggestedType")])
+
+              # EC2
+              for i in report.get("idle_ec2", []):
+                  w.writerow(["idle_ec2", i.get("instanceId"), "avgCpu%", f"{i.get('avgCpu'):.2f}"])
+              for o in report.get("over_provisioned", []):
+                  w.writerow(["over_provisioned", o.get("instanceId"), o.get("type"), f"cpu={o.get('avgCpu')} netIn={o.get('avgNetInBytes')} netOut={o.get('avgNetOutBytes')}"])
+              for s in report.get("spot_candidates", []):
+                  w.writerow(["spot_candidate", s.get("instanceId"), s.get("type"), f"avgCpu%={s.get('avgCpu')}"])
+
+              # EBS
+              for v in report.get("unattached_volumes", []):
+                  w.writerow(["unattached_volume", v, "", ""])
+              for s in report.get("old_snapshots", []):
+                  w.writerow(["old_snapshot", s, "", ""])
+              for s in report.get("orphaned_snapshots", []):
+                  w.writerow(["orphaned_snapshot", s, "", ""])
+              for g in report.get("gp2_to_gp3", []):
+                  w.writerow(["ebs_savings", g.get("volumeId"), "suggest", f"gp2->{g.get('suggested')} sizeGiB={g.get('sizeGiB')}"])
+
+              # RDS
+              for r in report.get("idle_rds", []):
+                  w.writerow(["idle_rds", r.get("db"), "avgCpu%", f"{r.get('avgCpu'):.2f}"])
+              for r in report.get("underutilized_rds", []):
+                  w.writerow(["underutilized_rds", r.get("db"), "avgCpu/Conns/FreeMB", f"{r.get('avgCpu')}|{r.get('avgConnections')}|{r.get('avgFreeableMB')}"])
+
+              # S3
+              for b in report.get("s3_unused", []):
+                  w.writerow(["s3_unused", b, "", ""])
+              for b in report.get("s3_missing_lifecycle", []):
+                  w.writerow(["s3_lifecycle_missing", b, "", ""])
+
+              # ELB / ASG
+              for l in report.get("low_elbs", []):
+                  w.writerow(["low_elb", l.get("name"), "avgRequestsPerDay", l.get("avgRequestsPerDay","")])
+              for t in report.get("unused_target_groups", []):
+                  w.writerow(["unused_target_group", t.get("name"), "", t.get("targetGroupArn")])
+              for a in report.get("underutilized_asg", []):
+                  w.writerow(["underutilized_asg", a.get("asg"), "desired|avgInService", f"{a.get('desired')}|{a.get('avgInService')}"])
+
+              # IAM
+              for k in report.get("unused_access_keys", []):
+                  w.writerow(["iam_unused_key", k.get("user"), "key_index", k.get("key_index")])
+              for r in report.get("stale_roles", []):
+                  w.writerow(["iam_role_stale", r.get("role"), "lastUsed", r.get("lastUsed")])
+
+              buf.seek(0)
+              s3.put_object(Bucket=S3_BUCKET, Key=csv_key, Body=buf.getvalue().encode("utf-8"))
+
+              # Minimal but richer HTML
+              html = f"""<html><body>
+              <h1>InfraSight Report</h1>
+              <p>Account: {ACCOUNT_ID} &middot; Region: {REGION} &middot; Generated: {ts}</p>
+              <h2>At-a-glance</h2>
+              <ul>
+                <li>Services cost lines: {len(report.get('cost_summary',[]))}</li>
+                <li>Spot candidates: {len(report.get('spot_candidates',[]))}</li>
+                <li>Over-provisioned EC2: {len(report.get('over_provisioned',[]))}</li>
+                <li>Idle EC2/RDS: {len(report.get('idle_ec2',[]))}/{len(report.get('idle_rds',[]))}</li>
+                <li>Unattached vols / gp2->gp3 recs: {len(report.get('unattached_volumes',[]))} / {len(report.get('gp2_to_gp3',[]))}</li>
+                <li>Old / Orphaned snapshots: {len(report.get('old_snapshots',[]))} / {len(report.get('orphaned_snapshots',[]))}</li>
+                <li>Low-traffic ELBs / Unused TGs: {len(report.get('low_elbs',[]))} / {len(report.get('unused_target_groups',[]))}</li>
+                <li>ASG under-utilized: {len(report.get('underutilized_asg',[]))}</li>
+                <li>S3 unused / Lifecycle missing: {len(report.get('s3_unused',[]))} / {len(report.get('s3_missing_lifecycle',[]))}</li>
+                <li>IAM: Unused keys / Stale roles: {len(report.get('unused_access_keys',[]))} / {len(report.get('stale_roles',[]))}</li>
+              </ul>
+
+              <h2>Recommendations</h2>
+              <ol>
+                <li><b>Move non-critical dev/test instances to Spot</b> where shown under Spot candidates.</li>
+                <li><b>Right-size over-provisioned EC2</b> (CPU &lt; {EC2_OVER_PROVISIONED_CPU_MAX}%).</li>
+                <li><b>Convert gp2 to gp3</b> for immediate EBS savings.</li>
+                <li><b>Clean unattached volumes / old & orphaned snapshots</b>.</li>
+                <li><b>Add S3 lifecycle policies</b> to transition infrequently accessed data.</li>
+                <li><b>Address idle RDS or scale down</b> under-utilized DBs.</li>
+                <li><b>Remove/repurpose unused target groups & low-traffic ELBs</b>.</li>
+                <li><b>Rotate or remove unused IAM access keys</b> and audit stale roles.</li>
+                <li><b>Consider Savings Plans / Reserved Instances</b> per CE recommendations.</li>
+              </ol>
+
+              <p>Download the CSV in the same prefix for full details.</p>
+              </body></html>"""
+              s3.put_object(Bucket=S3_BUCKET, Key=html_key, Body=html.encode("utf-8"), ContentType="text/html")
+
+              csv_url = f"s3://{S3_BUCKET}/{csv_key}"
+              html_url = f"s3://{S3_BUCKET}/{html_key}"
+              logger.info("Uploaded report CSV=%s HTML=%s", csv_url, html_url)
+              return csv_key, csv_url, html_key, html_url
+
+          def send_email(clients, subject, body):
+              ses = clients["ses"]
+              if not SENDER or not RECIPIENTS:
+                  logger.warning("Sender or recipients not set; skipping email")
+                  return
+              try:
+                  resp = ses.send_email(
+                      Source=SENDER,
+                      Destination={"ToAddresses": RECIPIENTS},
+                      Message={
+                          "Subject": {"Data": subject},
+                          "Body": {"Text": {"Data": body}}
+                      }
+                  )
+                  logger.info("SES sent MessageId=%s", resp.get("MessageId"))
+              except ClientError as e:
+                  logger.exception("SES send_email failed: %s", e)
+
+          def lambda_handler(event, context):
+              logger.info("InfraSight start")
+              clients = get_clients()
+
+              cost_summary = get_monthly_cost(clients)
+              compute_recs = get_compute_optimizer_recs(clients)
+
+              graviton_candidates = []
+              for r in compute_recs:
+                  inst_arn = r.get("instanceArn","")
+                  inst_id = inst_arn.split("/")[-1] if inst_arn else None
+                  current_type = r.get("currentInstanceType")
+                  suggested = None
+                  for o in r.get("recommendationOptions",[]):
+                      t = o.get("instanceType","")
+                      if t and (t.endswith("g") or "g." in t or t.startswith(("m6g","c7g","r6g","t4g","m7g"))):
+                          suggested = t; break
+                  if suggested:
+                      graviton_candidates.append({"instanceId": inst_id, "currentType": current_type, "suggestedType": suggested})
+
+              rightsizing = get_rightsizing(clients)
+              savings = get_savings_plan(clients)
+              ri_recs = get_ri_recs(clients)
+
+              # EC2 / EBS
+              idle_ec2 = detect_idle_ec2(clients)
+              over_provisioned = detect_over_provisioned_ec2(clients)
+              spot_candidates = detect_spot_candidates(clients)
+              unattached_volumes = detect_unattached_volumes(clients)
+              old_snapshots = detect_old_snapshots(clients)
+              orphaned_snapshots = detect_orphaned_snapshots(clients)
+              gp2_to_gp3 = suggest_gp2_to_gp3(clients)
+
+              # RDS
+              idle_rds = detect_idle_rds(clients)
+              underutilized_rds = detect_underutilized_rds(clients)
+
+              # S3
+              s3_unused = detect_unused_s3(clients)
+              s3_missing_lifecycle = detect_missing_lifecycle(clients)
+
+              # ELB / ASG
+              low_elbs = detect_low_traffic_elbs(clients)
+              unused_target_groups = detect_unused_target_groups(clients)
+              underutilized_asg = detect_underutilized_asg(clients)
+
+              # IAM
+              unused_access_keys = detect_unused_access_keys(clients)
+              stale_roles = detect_roles_not_recently_used(clients)
+
+              report = {
+                  "timestamp": datetime.utcnow().isoformat(),
+                  "cost_summary": cost_summary,
+                  "graviton_candidates": graviton_candidates,
+                  "rightsizing": rightsizing,
+                  "savings": savings,
+                  "ri_recs": ri_recs,
+
+                  "idle_ec2": idle_ec2,
+                  "over_provisioned": over_provisioned,
+                  "spot_candidates": spot_candidates,
+
+                  "unattached_volumes": unattached_volumes,
+                  "old_snapshots": old_snapshots,
+                  "orphaned_snapshots": orphaned_snapshots,
+                  "gp2_to_gp3": gp2_to_gp3,
+
+                  "idle_rds": idle_rds,
+                  "underutilized_rds": underutilized_rds,
+
+                  "s3_unused": s3_unused,
+                  "s3_missing_lifecycle": s3_missing_lifecycle,
+
+                  "low_elbs": low_elbs,
+                  "unused_target_groups": unused_target_groups,
+                  "underutilized_asg": underutilized_asg,
+
+                  "unused_access_keys": unused_access_keys,
+                  "stale_roles": stale_roles
+              }
+
+              csv_key, csv_url, html_key, html_url = generate_and_upload_report(clients, report)
+              subject = f"InfraSight Report - {ACCOUNT_ID}"
+              body = (
+                  f"InfraSight has generated a report.\n\n"
+                  f"Report (HTML object): {html_url}\nCSV object: {csv_url}\n\n"
+                  f"Key counts:\n"
+                  f"- Spot candidates: {len(spot_candidates)}\n"
+                  f"- Over-provisioned EC2: {len(over_provisioned)}\n"
+                  f"- Idle EC2/RDS: {len(idle_ec2)}/{len(idle_rds)}\n"
+                  f"- Unattached volumes: {len(unattached_volumes)}\n"
+                  f"- Old/Orphaned snapshots: {len(old_snapshots)}/{len(orphaned_snapshots)}\n"
+                  f"- S3 unused / lifecycle-missing: {len(s3_unused)} / {len(s3_missing_lifecycle)}\n"
+                  f"- Low-traffic ELBs / Unused TGs / Underutilized ASG: {len(low_elbs)} / {len(unused_target_groups)} / {len(underutilized_asg)}\n"
+                  f"- IAM unused keys / stale roles: {len(unused_access_keys)} / {len(stale_roles)}\n"
+              )
+              send_email(clients, subject, body)
+              logger.info("InfraSight finished")
+              return {"status": "ok", "report_csv": csv_key, "report_html": html_key}
+
+  ### EventBridge scheduled rule to run daily ###
+  InfraSightSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InfraSightFunction.Arn
+          Id: InfraSightTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InfraSightFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InfraSightSchedule.Arn
+
+Outputs:
+  InfraSightFunctionName:
+    Value: !Ref InfraSightFunction
+    Description: Name of the InfraSight Lambda function
+
+  ReportsBucketName:
+    Value: !If [ UseProvidedBucket, !Ref S3BucketName, !Ref ReportsBucket ]
+    Description: S3 bucket used to store generated reports
+
+  DemoResourcesCreated:
+    Value: !Ref CreateSampleResources
+    Description: Whether demo sample resources were created
