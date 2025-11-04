@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  InfraSight - CloudKeeper-style cost optimization and housekeeping checks.
+  InfraSight - cost optimization and housekeeping checks.
   Toggleable demo: Create sample resources (EC2, RDS, S3) and a scheduled Lambda
   that runs multiple checks and emails/stores a report. Extended insights: EC2 over-provisioned,
   Spot candidates, ASG under-utilization, EBS gp2->gp3, orphaned snapshots, RDS under-utilized,
